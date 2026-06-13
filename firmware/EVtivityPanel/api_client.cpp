@@ -182,12 +182,16 @@ bool api_get_site_info(String &addressOut, String &err) {
     if (code != 200) { err = "HTTP " + String(code); cleanup(http); return false; }
 
     JsonDocument filter;
+    filter["name"] = true;
     for (const char *k : {"address", "city", "state", "postalCode", "country"}) filter[k] = true;
     JsonDocument doc;
     DeserializationError e = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
     cleanup(http);
     if (e) { err = String("JSON: ") + e.c_str(); return false; }
 
+    // Site name first, then the postal address.
+    const char *nm = doc["name"] | "";
+    if (nm[0]) addressOut = nm;
     for (const char *k : {"address", "city", "state", "postalCode", "country"}) {
         const char *v = doc[k] | "";
         if (v[0]) { if (addressOut.length()) addressOut += ", "; addressOut += v; }
@@ -347,4 +351,66 @@ bool api_start_charging(const String &ocppId, int evseId, String &err) {
 
 bool api_ocpp_command(const String &version, const String &command, const String &jsonBody, String &err) {
     return post("/v1/ocpp/commands/" + version + "/" + command, jsonBody, HTTP_CMD_TIMEOUT_MS, err);
+}
+
+// Aggregate site figures for the Dashboard. Both endpoints are site-scoped to the API
+// key's user and require dashboard:read; a 403 sets out.forbidden so the UI can hide them.
+bool api_fetch_dashboard(DashboardStats &out) {
+    out = DashboardStats();
+    if (g.csmsUrl.length() == 0) return false;
+
+    // Energy today: sum the day rows from the trailing-24h history.
+    {
+        HTTPClient http;
+        if (!begin_req(http, "/v1/dashboard/energy-history?days=1", HTTP_GET_TIMEOUT_MS)) { cleanup(http); return false; }
+        int code = http.GET();
+        if (code == 403) { out.forbidden = true; cleanup(http); return false; }
+        if (code != 200) { cleanup(http); return false; }
+        JsonDocument filter; filter[0]["energyWh"] = true;
+        JsonDocument doc;
+        DeserializationError e = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+        cleanup(http);
+        if (e) return false;
+        double sum = 0;
+        for (JsonObject r : doc.as<JsonArray>()) sum += (double)(r["energyWh"] | 0.0);
+        out.todayEnergyWh = sum;
+    }
+
+    // Sessions today.
+    {
+        HTTPClient http;
+        if (!begin_req(http, "/v1/dashboard/session-history?days=1", HTTP_GET_TIMEOUT_MS)) { cleanup(http); return false; }
+        int code = http.GET();
+        if (code == 403) { out.forbidden = true; cleanup(http); return false; }
+        if (code != 200) { cleanup(http); return false; }
+        JsonDocument filter; filter[0]["count"] = true;
+        JsonDocument doc;
+        DeserializationError e = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+        cleanup(http);
+        if (e) return false;
+        long sum = 0;
+        for (JsonObject r : doc.as<JsonArray>()) sum += (long)(r["count"] | 0L);
+        out.todaySessions = sum;
+    }
+
+    // Revenue + profit today (server-side calendar day).
+    {
+        HTTPClient http;
+        if (!begin_req(http, "/v1/dashboard/financial-stats", HTTP_GET_TIMEOUT_MS)) { cleanup(http); return false; }
+        int code = http.GET();
+        if (code == 403) { out.forbidden = true; cleanup(http); return false; }
+        if (code != 200) { cleanup(http); return false; }
+        JsonDocument filter;
+        filter["todayRevenueCents"] = true;
+        filter["todayProfitCents"] = true;
+        JsonDocument doc;
+        DeserializationError e = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+        cleanup(http);
+        if (e) return false;
+        out.todayRevenueCents = doc["todayRevenueCents"] | 0L;
+        out.todayProfitCents = doc["todayProfitCents"] | 0L;
+    }
+
+    out.valid = true;
+    return true;
 }

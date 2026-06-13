@@ -138,6 +138,14 @@ static void network_task(void *arg) {
                     ui_set_snapshot(snap);
                     lvgl_port_unlock();
                 }
+                // Dashboard aggregate figures, only while that tab is showing.
+                bool onDash = false;
+                if (lvgl_port_lock(-1)) { onDash = ui_on_dashboard(); lvgl_port_unlock(); }
+                if (onDash) {
+                    DashboardStats ds;
+                    api_fetch_dashboard(ds);
+                    if (lvgl_port_lock(-1)) { ui_set_dashboard(ds); lvgl_port_unlock(); }
+                }
                 // live detail for the selected charging station, if any
                 String sid;
                 if (lvgl_port_lock(-1)) { sid = ui_selected_station_id(); lvgl_port_unlock(); }

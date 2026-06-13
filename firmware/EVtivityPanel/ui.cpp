@@ -23,7 +23,11 @@
 static void (*g_cmd_cb)(const Command &) = nullptr;
 static SiteSnapshot g_snap;
 static int g_sel = 0;
-static int g_tab = 0; // 0 charging, 1 settings
+static int g_tab = 2; // 0 charging, 1 settings, 2 dashboard (the default/main screen)
+// Tab bar display order -> g_tab value. Dashboard is leftmost and the default; Charging
+// stays g_tab 0 and Settings g_tab 1 so all the existing g_tab checks keep working.
+static const int TAB_ORDER[3] = {2, 0, 1};
+static const char *const TAB_LABELS[3] = {"Dashboard", "Charging", "Settings"};
 static Settings g_settings;
 static NetState g_net_state = NET_CONNECTING;
 static String g_ap_ssid;
@@ -55,19 +59,31 @@ static int g_chartMode = 0;                   // 0 = power (kW), 1 = cumulative 
 static String g_sessKey;                     // structure signature of the session detail
 static lv_obj_t *g_listRow[MAX_STATIONS];    // station list rows (highlight updated in place)
 static lv_obj_t *g_rowStat[MAX_STATIONS];    // per-row status label (updated in place)
+static String g_rowStatus[MAX_STATIONS];     // last status applied to each row (cheap change check)
 static int g_listRowN = 0;
 static String g_listKey;                     // structure signature of the station list
 static lv_obj_t *g_detail = nullptr;         // detail card; rebuilt alone on selection
 static bool g_detailDirty = false;           // a poll changed detail structure; rebuild once at commit
 
 static lv_obj_t *g_content = nullptr;
-static lv_obj_t *g_tab_btn[2] = {nullptr, nullptr};
+static lv_obj_t *g_tab_btn[3] = {nullptr, nullptr, nullptr};
 static lv_obj_t *g_wifi_lbl = nullptr;
+
+// Dashboard tab (g_tab == 2). Built once per tab-entry; values updated in place.
+static DashboardStats g_dash;
+static lv_obj_t *g_dashKpi[4] = {nullptr, nullptr, nullptr, nullptr}; // Online, Charging, Available, Faults
+static lv_obj_t *g_dashSeg[5] = {nullptr, nullptr, nullptr, nullptr, nullptr}; // status bar segments
+static lv_obj_t *g_dashLeg[5] = {nullptr, nullptr, nullptr, nullptr, nullptr}; // legend count labels
+static int g_dashSegLast[5] = {-1, -1, -1, -1, -1};                  // last segment counts (skip relayout)
+static lv_obj_t *g_dashT2[4] = {nullptr, nullptr, nullptr, nullptr};  // Energy, Sessions, Rev today, Rev total
+static lv_obj_t *g_dashSite = nullptr;
 
 void ui_rebuild();
 static void ui_render_root();
 static void build_detail(lv_obj_t *detail);
 static void rebuild_detail();
+static void build_dashboard(lv_obj_t *parent);
+static void dash_apply();
 
 // EVtivity brand mark, pre-decoded from evtivity-logo.svg (LVGL 8.4 has no SVG renderer).
 #define LOGO_TOP 34
@@ -432,6 +448,23 @@ static void on_chart_mode(lv_event_t *e) {
     chart_apply(g_session);
 }
 
+// A connector that is part of an active session (plugged / charging / paused), as
+// opposed to free. Used to hide idle sibling connectors while the station charges.
+static bool conn_in_use(const String &s) {
+    return s == "charging" || s == "occupied" || s == "preparing" || s == "ev_connected" ||
+           s == "suspended_ev" || s == "suspended_evse" || s == "idle" || s == "discharging";
+}
+
+// Start/Stop enablement for a connector status, as a 2-char code. Keying the detail
+// on this (not the raw status) means the detail rebuilds only when a button's enabled
+// state actually flips, not on every status jitter between same-enablement states
+// (e.g. charging <-> suspended_ev are both stoppable).
+static String btn_state_code(const String &st) {
+    bool startable = (st == "available" || st == "preparing" || st == "occupied" || st == "ev_connected");
+    bool stoppable = (st == "charging" || st == "suspended_ev" || st == "suspended_evse");
+    return String(startable ? "1" : "0") + (stoppable ? "1" : "0");
+}
+
 static void build_charging(lv_obj_t *parent) {
     lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(parent, 14, 0);
@@ -500,7 +533,7 @@ static void build_charging(lv_obj_t *parent) {
 
         lv_obj_t *b = txt(row, status_label(s.status).c_str(), &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(b, status_color(s.status), 0);
-        if (i < MAX_STATIONS) g_rowStat[i] = b;
+        if (i < MAX_STATIONS) { g_rowStat[i] = b; g_rowStatus[i] = s.status; }
     }
     g_listRowN = g_snap.count;
     g_listKey = String(g_snap.count);
@@ -557,9 +590,19 @@ static void build_detail(lv_obj_t *detail) {
         lv_obj_set_style_text_color(st, status_color(s.status), 0);
         txt(detail, s.model.length() ? s.model.c_str() : "--", &lv_font_montserrat_14, C_MUTED);
 
-        // ports (all connectors of this station); tap a port to target it with the actions
+        // ports of this station; tap a port to target it with the actions. When the
+        // station is charging, show only the connector(s) in the active session and
+        // hide the idle siblings. With nothing charging, show every connector.
         if (g_connectors.stationId == s.id && g_connectors.count > 0) {
-            if (g_selPort >= g_connectors.count) g_selPort = 0;
+            bool anyInUse = false;
+            for (int i = 0; i < g_connectors.count; i++)
+                if (conn_in_use(g_connectors.items[i].status)) { anyInUse = true; break; }
+            if (g_selPort < 0 || g_selPort >= g_connectors.count) g_selPort = 0;
+            // Keep the selection on a shown connector (the charging one) while filtered.
+            if (anyInUse && !conn_in_use(g_connectors.items[g_selPort].status))
+                for (int i = 0; i < g_connectors.count; i++)
+                    if (conn_in_use(g_connectors.items[i].status)) { g_selPort = i; break; }
+            for (int i = 0; i < MAX_CONNECTORS; i++) g_portStat[i] = nullptr;
             lv_obj_t *ports = plain(detail);
             lv_obj_set_width(ports, LV_PCT(100));
             lv_obj_set_height(ports, LV_SIZE_CONTENT);
@@ -567,6 +610,7 @@ static void build_detail(lv_obj_t *detail) {
             lv_obj_set_flex_flow(ports, LV_FLEX_FLOW_COLUMN);
             lv_obj_set_style_pad_row(ports, 6, 0);
             for (int i = 0; i < g_connectors.count; i++) {
+                if (anyInUse && !conn_in_use(g_connectors.items[i].status)) continue; // hide idle sibling
                 Connector &k = g_connectors.items[i];
                 bool sel = (i == g_selPort);
                 lv_obj_t *pr = lv_obj_create(ports);
@@ -594,9 +638,10 @@ static void build_detail(lv_obj_t *detail) {
             g_portStatN = g_connectors.count;
             g_portKey = String(s.id) + "|" + String(g_connectors.count) + "|" + String(g_selPort);
             for (int i = 0; i < g_connectors.count; i++)
-                g_portKey += "|" + String(g_connectors.items[i].connectorId);
+                g_portKey += "|" + String(g_connectors.items[i].connectorId) +
+                             (conn_in_use(g_connectors.items[i].status) ? "u" : "");
             if (g_selPort < g_connectors.count)
-                g_portKey += "|sel:" + g_connectors.items[g_selPort].status;
+                g_portKey += "|sel:" + btn_state_code(g_connectors.items[g_selPort].status);
         }
 
         if (s.status == "charging" && g_session.active && g_session.stationId == s.id) {
@@ -705,10 +750,9 @@ static void build_detail(lv_obj_t *detail) {
         String aStatus = s.status;
         if (g_connectors.stationId == s.id && g_selPort >= 0 && g_selPort < g_connectors.count)
             aStatus = g_connectors.items[g_selPort].status;
-        bool startable = (aStatus == "available" || aStatus == "preparing" ||
-                          aStatus == "occupied" || aStatus == "ev_connected");
-        bool stoppable = (aStatus == "charging" || aStatus == "suspended_ev" ||
-                          aStatus == "suspended_evse");
+        String sc = btn_state_code(aStatus);
+        bool startable = sc[0] == '1';
+        bool stoppable = sc[1] == '1';
         abtn(actions, LV_SYMBOL_PLAY "  Start", C_GREEN, 0, startable);
         abtn(actions, LV_SYMBOL_STOP "  Stop", C_RED, 1, stoppable);
         // Simulators get a Simulate button that opens a Plug In / Unplug popup.
@@ -746,6 +790,28 @@ static void field(lv_obj_t *p, const char *k, const String &v) {
     txt(row, v.length() ? v.c_str() : "--", &lv_font_montserrat_16, C_TEXT);
 }
 
+static void on_reboot_confirm(lv_event_t *e) {
+    (void)e;
+    ESP.restart();
+}
+
+static void on_reboot(lv_event_t *e) {
+    (void)e;
+    lv_obj_t *card = make_modal("Reboot panel");
+    lv_obj_t *sub = txt(card, "Reboot the panel now?", &lv_font_montserrat_20, C_MUTED);
+    lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(sub, LV_PCT(100));
+    lv_label_set_long_mode(sub, LV_LABEL_LONG_WRAP);
+    lv_obj_t *row = plain(card);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(row, 12, 0);
+    popup_btn(row, "Reboot", C_RED, on_reboot_confirm);
+    popup_btn(row, "Cancel", C_ELEV, popup_close);
+    lv_obj_add_event_cb(g_popup, popup_close, LV_EVENT_CLICKED, nullptr);
+}
+
 static void build_settings(lv_obj_t *parent) {
     lv_obj_t *cc = card(parent);
     lv_obj_set_size(cc, LV_PCT(100), LV_PCT(100));
@@ -759,10 +825,32 @@ static void build_settings(lv_obj_t *parent) {
                          : (g_settings.apiKey.length() ? "(set)" : "");
     field(cc, "API Key", keyMask);
     field(cc, "Site ID", g_settings.siteId);
-    field(cc, "Site Address", g_site_address);
+    field(cc, "Site", g_site_address);
     field(cc, "WiFi", g_settings.wifiSsid);
     field(cc, "CSMS Version", g_csms_version);
     field(cc, "Firmware", String(FW_VERSION));
+
+    // Push the action row to the bottom, right-aligned.
+    lv_obj_t *sp = plain(cc);
+    lv_obj_set_width(sp, LV_PCT(100));
+    lv_obj_set_flex_grow(sp, 1);
+    lv_obj_t *actions = plain(cc);
+    lv_obj_set_width(actions, LV_PCT(100));
+    lv_obj_set_height(actions, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *rb = lv_btn_create(actions);
+    lv_obj_set_height(rb, 48);
+    lv_obj_set_style_pad_hor(rb, 26, 0);
+    lv_obj_set_style_bg_color(rb, lv_color_hex(C_RED), 0);
+    lv_obj_set_style_radius(rb, 10, 0);
+    lv_obj_set_style_shadow_width(rb, 0, 0);
+    lv_obj_add_event_cb(rb, on_reboot, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *rl = lv_label_create(rb);
+    lv_label_set_text(rl, LV_SYMBOL_POWER "  Reboot");
+    lv_obj_set_style_text_font(rl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(rl, lv_color_hex(0xffffff), 0);
+    lv_obj_center(rl);
 }
 
 static void step(lv_obj_t *p, const char *num, const char *label, const String &value) {
@@ -820,6 +908,152 @@ static void build_provision(lv_obj_t *scr) {
     step(c, "3", "Sign in, then enter your CSMS details", login);
 }
 
+// --- Dashboard tab -------------------------------------------------------------
+static void setLbl(lv_obj_t *l, const String &v) {
+    if (l && v != lv_label_get_text(l)) lv_label_set_text(l, v.c_str());
+}
+
+static const uint32_t DASH_SEG_COLORS[5] = {C_GREEN, C_PRIMARY, C_ORANGE, C_AMBER, C_RED};
+static const char *const DASH_SEG_NAMES[5] = {"Charging", "Available", "Reserved", "Suspended", "Unavailable"};
+
+// A boxed KPI that fills its row: big value centered, muted label below. Returns the value label.
+static lv_obj_t *kpi(lv_obj_t *p, const char *label, const lv_font_t *valFont) {
+    lv_obj_t *c = card(p);
+    lv_obj_set_flex_grow(c, 1);
+    lv_obj_set_height(c, LV_PCT(100));
+    lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_ver(c, 16, 0);
+    lv_obj_set_style_pad_row(c, 4, 0);
+    lv_obj_t *v = txt(c, "-", valFont, C_TEXT);
+    lv_obj_t *l = txt(c, label, &lv_font_montserrat_14, C_MUTED);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    return v;
+}
+
+// Recompute the dashboard figures and push them into the existing widgets in place.
+// Tier 1 (online / charging / available / faults + status bar + legend) comes from the
+// station snapshot; the Today cards come from the fetched dashboard stats.
+static void dash_apply() {
+    if (g_tab != 2 || !g_dashKpi[0]) return;
+    int total = g_snap.count, online = 0, charging = 0, available = 0, reserved = 0, susp = 0, attn = 0;
+    for (int i = 0; i < g_snap.count; i++) {
+        const Station &s = g_snap.stations[i];
+        if (s.isOnline) online++;
+        const String &st = s.status;
+        if (st == "charging") charging++;
+        else if (st == "available") available++;
+        else if (st == "reserved") reserved++;
+        else if (st == "suspended_ev" || st == "suspended_evse" || st == "idle") susp++;
+        else if (st == "faulted" || st == "unavailable") attn++;
+    }
+    setLbl(g_dashKpi[0], String(online) + "/" + String(total));
+    setLbl(g_dashKpi[1], String(charging));
+    setLbl(g_dashKpi[2], String(available));
+    setLbl(g_dashKpi[3], String(attn));
+
+    // Status bar + legend: only re-flow the bar when a count actually changed.
+    int counts[5] = {charging, available, reserved, susp, attn};
+    bool segChanged = false;
+    for (int i = 0; i < 5; i++) if (counts[i] != g_dashSegLast[i]) segChanged = true;
+    if (segChanged) {
+        for (int i = 0; i < 5; i++) {
+            if (g_dashSeg[i]) lv_obj_set_flex_grow(g_dashSeg[i], counts[i]);
+            setLbl(g_dashLeg[i], String(DASH_SEG_NAMES[i]) + " " + String(counts[i]));
+            g_dashSegLast[i] = counts[i];
+        }
+    }
+
+    if (g_dash.forbidden) {
+        for (int i = 0; i < 4; i++) setLbl(g_dashT2[i], "n/a");
+    } else if (!g_dash.valid) {
+        for (int i = 0; i < 4; i++) setLbl(g_dashT2[i], "...");
+    } else {
+        setLbl(g_dashT2[0], String(g_dash.todayEnergyWh / 1000.0, 1) + " kWh");
+        setLbl(g_dashT2[1], String(g_dash.todaySessions));
+        setLbl(g_dashT2[2], "$" + String(g_dash.todayRevenueCents / 100.0, 2));
+        setLbl(g_dashT2[3], "$" + String(g_dash.todayProfitCents / 100.0, 2));
+    }
+    if (g_dashSite)
+        setLbl(g_dashSite, g_site_address.length() ? g_site_address : String("Site overview"));
+}
+
+static void build_dashboard(lv_obj_t *parent) {
+    lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(parent, 10, 0);
+
+    g_dashSite = txt(parent, g_site_address.length() ? g_site_address.c_str() : "Site overview",
+                     &lv_font_montserrat_16, C_MUTED);
+
+    // KPI cards (this row grows to fill the upper half)
+    lv_obj_t *row = plain(parent);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_flex_grow(row, 1);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(row, 12, 0);
+    g_dashKpi[0] = kpi(row, "Online", &lv_font_montserrat_40);
+    g_dashKpi[1] = kpi(row, "Charging", &lv_font_montserrat_40);
+    g_dashKpi[2] = kpi(row, "Available", &lv_font_montserrat_40);
+    g_dashKpi[3] = kpi(row, "Needs attention", &lv_font_montserrat_40);
+
+    // Today cards (this row grows to fill the lower half)
+    txt(parent, "Today", &lv_font_montserrat_12, C_MUTED);
+    lv_obj_t *row2 = plain(parent);
+    lv_obj_set_width(row2, LV_PCT(100));
+    lv_obj_set_flex_grow(row2, 1);
+    lv_obj_set_flex_flow(row2, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(row2, 12, 0);
+    g_dashT2[0] = kpi(row2, "Energy", &lv_font_montserrat_28);
+    g_dashT2[1] = kpi(row2, "Sessions", &lv_font_montserrat_28);
+    g_dashT2[2] = kpi(row2, "Revenue", &lv_font_montserrat_28);
+    g_dashT2[3] = kpi(row2, "Profit", &lv_font_montserrat_28);
+
+    // Connector status bar + legend, pinned at the bottom
+    txt(parent, "Connector status", &lv_font_montserrat_12, C_MUTED);
+    lv_obj_t *bar = lv_obj_create(parent);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(bar, LV_PCT(100));
+    lv_obj_set_height(bar, 16);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(C_ELEV), 0);
+    lv_obj_set_style_border_width(bar, 0, 0);
+    lv_obj_set_style_radius(bar, 8, 0);
+    lv_obj_set_style_pad_all(bar, 0, 0);
+    lv_obj_set_style_pad_column(bar, 0, 0); // no gaps between segments (no gray slivers)
+    lv_obj_set_style_clip_corner(bar, true, 0);
+    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t *seg = plain(bar);
+        lv_obj_set_height(seg, LV_PCT(100));
+        lv_obj_set_width(seg, 0);
+        lv_obj_set_style_bg_color(seg, lv_color_hex(DASH_SEG_COLORS[i]), 0);
+        lv_obj_set_style_bg_opa(seg, LV_OPA_COVER, 0);
+        g_dashSeg[i] = seg;
+    }
+
+    lv_obj_t *leg = plain(parent);
+    lv_obj_set_width(leg, LV_PCT(100));
+    lv_obj_set_height(leg, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(leg, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(leg, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(leg, 18, 0);
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t *item = plain(leg);
+        lv_obj_set_size(item, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(item, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(item, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(item, 6, 0);
+        lv_obj_t *dot = plain(item);
+        lv_obj_set_size(dot, 12, 12);
+        lv_obj_set_style_radius(dot, 6, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(DASH_SEG_COLORS[i]), 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        g_dashLeg[i] = txt(item, DASH_SEG_NAMES[i], &lv_font_montserrat_14, C_MUTED);
+    }
+
+    for (int i = 0; i < 5; i++) g_dashSegLast[i] = -1; // force the first apply to draw the bar/legend
+    dash_apply();
+}
+
 static void build_main(lv_obj_t *scr) {
     // top bar
     lv_obj_t *bar = lv_obj_create(scr);
@@ -850,23 +1084,26 @@ static void build_main(lv_obj_t *scr) {
     lv_obj_set_flex_flow(tabwrap, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(tabwrap, 6, 0);
 
-    const char *tabs[2] = {"Charging", "Settings"};
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         lv_obj_t *t = lv_obj_create(tabwrap);
         lv_obj_clear_flag(t, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_size(t, LV_SIZE_CONTENT, 36);
         lv_obj_set_style_radius(t, 8, 0);
         lv_obj_set_style_border_width(t, 0, 0);
         lv_obj_set_style_bg_color(t, lv_color_hex(C_PRIMARY), 0);
-        lv_obj_set_style_bg_opa(t, i == g_tab ? LV_OPA_COVER : 0, 0);
+        lv_obj_set_style_bg_opa(t, TAB_ORDER[i] == g_tab ? LV_OPA_COVER : 0, 0);
         lv_obj_set_style_pad_hor(t, 16, 0);
         lv_obj_add_flag(t, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(t, [](lv_event_t *e) {
-            g_tab = (int)(intptr_t)lv_event_get_user_data(e);
+            int nt = (int)(intptr_t)lv_event_get_user_data(e);
+            if (nt == g_tab) return;
+            g_tab = nt;
             ui_rebuild();
-        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+            // refresh the newly shown tab's data promptly instead of waiting a full poll
+            if (g_cmd_cb) { Command c; c.type = CMD_REFRESH; g_cmd_cb(c); }
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)TAB_ORDER[i]);
         lv_obj_t *tl = lv_label_create(t);
-        lv_label_set_text(tl, tabs[i]);
+        lv_label_set_text(tl, TAB_LABELS[i]);
         lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(tl, lv_color_hex(0xffffff), 0);
         lv_obj_center(tl);
@@ -919,6 +1156,10 @@ void ui_rebuild() {
     g_chartObj = nullptr; g_chartSer = nullptr; g_chartPeak = nullptr; g_chartEnd = nullptr;
     g_chartCap = nullptr; g_chartTog[0] = nullptr; g_chartTog[1] = nullptr; g_sessKey = "";
     g_listRowN = 0; g_listKey = ""; g_detail = nullptr;
+    for (int i = 0; i < 4; i++) g_dashKpi[i] = nullptr;
+    for (int i = 0; i < 5; i++) { g_dashSeg[i] = nullptr; g_dashLeg[i] = nullptr; g_dashSegLast[i] = -1; }
+    for (int i = 0; i < 4; i++) g_dashT2[i] = nullptr;
+    g_dashSite = nullptr;
     lv_obj_clean(g_content);
     lv_obj_set_flex_flow(g_content, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(g_content, 12, 0);
@@ -932,10 +1173,11 @@ void ui_rebuild() {
     lv_obj_set_width(body, LV_PCT(100));
     lv_obj_set_flex_grow(body, 1);
     if (g_tab == 1) build_settings(body);
+    else if (g_tab == 2) build_dashboard(body);
     else build_charging(body);
 
-    for (int i = 0; i < 2; i++) {
-        if (g_tab_btn[i]) lv_obj_set_style_bg_opa(g_tab_btn[i], i == g_tab ? LV_OPA_COVER : 0, 0);
+    for (int i = 0; i < 3; i++) {
+        if (g_tab_btn[i]) lv_obj_set_style_bg_opa(g_tab_btn[i], TAB_ORDER[i] == g_tab ? LV_OPA_COVER : 0, 0);
     }
 }
 
@@ -943,7 +1185,7 @@ static void ui_render_root() {
     lv_obj_t *scr = lv_scr_act();
     g_content = nullptr;
     g_wifi_lbl = nullptr;
-    g_tab_btn[0] = g_tab_btn[1] = nullptr;
+    g_tab_btn[0] = g_tab_btn[1] = g_tab_btn[2] = nullptr;
     lv_obj_clean(scr);
     if (prov_mode()) build_provision(scr);
     else build_main(scr);
@@ -964,7 +1206,14 @@ void ui_set_snapshot(const SiteSnapshot &snap) {
     g_snap = snap;
     if (g_sel >= g_snap.count) g_sel = 0;
     if (prov_mode()) return;
-    if (g_wifi_lbl) lv_obj_set_style_text_color(g_wifi_lbl, lv_color_hex(snap.valid ? C_GREEN : C_MUTED), 0);
+    if (g_wifi_lbl) {
+        static bool s_wifiOk = false; static bool s_wifiInit = false;
+        if (!s_wifiInit || snap.valid != s_wifiOk) {
+            s_wifiInit = true; s_wifiOk = snap.valid;
+            lv_obj_set_style_text_color(g_wifi_lbl, lv_color_hex(snap.valid ? C_GREEN : C_MUTED), 0);
+        }
+    }
+    if (g_tab == 2) { dash_apply(); return; } // Dashboard counts come from this snapshot
     if (g_tab != 0) return;
     // Same set of stations: update each row's status in place. Rebuilding the whole
     // list every poll is heavy with many stations and flashes (it also overran the
@@ -974,14 +1223,17 @@ void ui_set_snapshot(const SiteSnapshot &snap) {
     if (key == g_listKey && g_listRowN == snap.count) {
         for (int i = 0; i < snap.count && i < g_listRowN && i < MAX_STATIONS; i++) {
             if (!g_rowStat[i]) continue;
-            String lbl = status_label(snap.stations[i].status);
-            // Skip if unchanged: lv_label_set_text always invalidates, so writing the
-            // same text every poll would redraw the whole list and flicker.
-            if (lbl == lv_label_get_text(g_rowStat[i])) continue;
-            lv_label_set_text(g_rowStat[i], lbl.c_str());
-            lv_obj_set_style_text_color(g_rowStat[i], status_color(snap.stations[i].status), 0);
+            const String &st = snap.stations[i].status;
+            // Compare the raw status (cheap; no label build, no widget read). The vast
+            // majority of rows are unchanged each poll, so this skips them with one
+            // String compare and touches no widgets - the redraw and the time spent
+            // holding the LVGL lock both drop to only what actually changed.
+            if (st == g_rowStatus[i]) continue;
+            g_rowStatus[i] = st;
+            lv_label_set_text(g_rowStat[i], status_label(st).c_str());
+            lv_obj_set_style_text_color(g_rowStat[i], status_color(st), 0);
             if (g_listRow[i])
-                lv_obj_set_style_border_color(g_listRow[i], status_color(snap.stations[i].status), 0);
+                lv_obj_set_style_border_color(g_listRow[i], status_color(st), 0);
         }
         // The selected station's status feeds the detail header and action buttons.
         String selStatus = (g_sel < snap.count) ? snap.stations[g_sel].status : String("");
@@ -1021,7 +1273,7 @@ void ui_set_perm_status(const String &missing, const String &err) {
 }
 
 String ui_selected_station_id() {
-    if (prov_mode() || g_snap.count == 0 || g_sel >= g_snap.count) return "";
+    if (prov_mode() || g_tab != 0 || g_snap.count == 0 || g_sel >= g_snap.count) return "";
     Station &s = g_snap.stations[g_sel];
     return (s.status == "charging") ? s.id : String("");
 }
@@ -1041,14 +1293,24 @@ void ui_set_session(const SessionDetail &sd) {
         if (v1 != lv_label_get_text(g_statVal[1])) lv_label_set_text(g_statVal[1], v1.c_str());
         if (v2 != lv_label_get_text(g_statVal[2])) lv_label_set_text(g_statVal[2], v2.c_str());
         if (v3 != lv_label_get_text(g_statVal[3])) lv_label_set_text(g_statVal[3], v3.c_str());
+        // Repaint the chart only when a new sample actually arrived. The chart redraw
+        // is the largest per-poll invalidation, and the panel polls faster than the
+        // meter-value interval, so most polls bring no new point - skipping them avoids
+        // a needless full-chart repaint (a common flicker source while charging).
         if (g_chartObj && g_chartSer && sd.sampleCount >= 2) {
-            chart_apply(sd); // data + range + peak label + caption for the active mode
-            if (g_chartEnd) {
-                long span = (sd.sampleEpoch[0] > 0)
-                                ? (long)sd.sampleEpoch[sd.sampleCount - 1] - (long)sd.sampleEpoch[0] : 0;
-                if (span < 0) span = 0;
-                char eb[12]; snprintf(eb, sizeof(eb), "%d:%02d", (int)(span / 60), (int)(span % 60));
-                if (String(eb) != lv_label_get_text(g_chartEnd)) lv_label_set_text(g_chartEnd, eb);
+            static String s_chartSig;
+            String sig = sd.stationId + "|" + String(sd.sampleCount) + "|" +
+                         String(sd.sampleEpoch[sd.sampleCount - 1]);
+            if (sig != s_chartSig) {
+                s_chartSig = sig;
+                chart_apply(sd); // data + range + peak label + caption for the active mode
+                if (g_chartEnd) {
+                    long span = (sd.sampleEpoch[0] > 0)
+                                    ? (long)sd.sampleEpoch[sd.sampleCount - 1] - (long)sd.sampleEpoch[0] : 0;
+                    if (span < 0) span = 0;
+                    char eb[12]; snprintf(eb, sizeof(eb), "%d:%02d", (int)(span / 60), (int)(span % 60));
+                    if (String(eb) != lv_label_get_text(g_chartEnd)) lv_label_set_text(g_chartEnd, eb);
+                }
             }
         }
         return;
@@ -1059,11 +1321,20 @@ void ui_set_session(const SessionDetail &sd) {
 void ui_set_site_address(const String &addr) {
     if (addr == g_site_address) return;
     g_site_address = addr;
-    if (!prov_mode() && g_tab == 1) ui_rebuild();
+    if (prov_mode()) return;
+    if (g_tab == 1) ui_rebuild();
+    else if (g_tab == 2) dash_apply();
 }
 
+void ui_set_dashboard(const DashboardStats &ds) {
+    g_dash = ds;
+    if (!prov_mode() && g_tab == 2) dash_apply();
+}
+
+bool ui_on_dashboard() { return !prov_mode() && g_tab == 2; }
+
 String ui_selected_station_internal_id() {
-    if (prov_mode() || g_snap.count == 0 || g_sel >= g_snap.count) return "";
+    if (prov_mode() || g_tab != 0 || g_snap.count == 0 || g_sel >= g_snap.count) return "";
     return g_snap.stations[g_sel].id;
 }
 
@@ -1072,8 +1343,9 @@ void ui_set_connectors(const ConnectorSet &set) {
     if (prov_mode() || g_tab != 0) return;
     // Structure key must match build_charging's g_portKey exactly.
     String key = String(set.stationId) + "|" + String(set.count) + "|" + String(g_selPort);
-    for (int i = 0; i < set.count; i++) key += "|" + String(set.items[i].connectorId);
-    if (g_selPort < set.count) key += "|sel:" + set.items[g_selPort].status;
+    for (int i = 0; i < set.count; i++)
+        key += "|" + String(set.items[i].connectorId) + (conn_in_use(set.items[i].status) ? "u" : "");
+    if (g_selPort < set.count) key += "|sel:" + btn_state_code(set.items[g_selPort].status);
     if (key == g_portKey && g_portStatN == set.count) {
         // Same layout: update the port status chips in place, no teardown (a full rebuild flashes).
         for (int i = 0; i < set.count && i < g_portStatN && i < MAX_CONNECTORS; i++) {

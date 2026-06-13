@@ -40,6 +40,17 @@ struct SiteSnapshot {
     uint32_t updatedAtMs = 0;
 };
 
+// Aggregate site figures for the Dashboard tab, from /v1/dashboard/{stats,financial-stats}.
+// Site-scoped to the API key's user. Needs the dashboard:read permission.
+struct DashboardStats {
+    bool valid = false;         // a successful fetch populated this
+    bool forbidden = false;     // 403: the API key lacks dashboard:read
+    double todayEnergyWh = 0;   // energy delivered today (last 24h)
+    long todaySessions = 0;     // sessions started today (last 24h)
+    long todayRevenueCents = 0; // revenue today (server-side calendar day)
+    long todayProfitCents = 0;  // revenue minus electricity cost today
+};
+
 // Live detail of the active charging session on the selected station.
 #define MAX_POWER_SAMPLES 30
 struct SessionDetail {

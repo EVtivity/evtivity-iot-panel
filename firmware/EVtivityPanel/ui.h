@@ -46,5 +46,12 @@ void ui_set_session(const SessionDetail &sd);
 // Publish the site address shown in Settings. Caller MUST hold lvgl_port_lock().
 void ui_set_site_address(const String &addr);
 
+// Publish aggregate site figures for the Dashboard tab. Caller MUST hold lvgl_port_lock().
+void ui_set_dashboard(const DashboardStats &ds);
+
+// True when the Dashboard tab is showing; the network task polls dashboard stats only then.
+// Caller MUST hold lvgl_port_lock().
+bool ui_on_dashboard();
+
 // Register the callback the UI calls when the operator taps an action.
 void ui_set_command_cb(void (*cb)(const Command &));

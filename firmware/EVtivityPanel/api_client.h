@@ -37,3 +37,7 @@ bool api_start_charging(const String &ocppId, int evseId, String &err);
 
 // POST /v1/ocpp/commands/{version}/{command} with a raw JSON body. Real stations.
 bool api_ocpp_command(const String &version, const String &command, const String &jsonBody, String &err);
+
+// GET /v1/dashboard/{stats,financial-stats} -> aggregate site figures for the Dashboard
+// tab. Needs the dashboard:read scope; on 403 returns false with out.forbidden set.
+bool api_fetch_dashboard(DashboardStats &out);

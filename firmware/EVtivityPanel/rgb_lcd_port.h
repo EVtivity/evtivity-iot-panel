@@ -34,7 +34,7 @@
  */
 #define EXAMPLE_LCD_H_RES               (1024)  ///< Horizontal resolution in pixels
 #define EXAMPLE_LCD_V_RES               (600)  ///< Vertical resolution in pixels
-#define EXAMPLE_LCD_PIXEL_CLOCK_HZ      (30 * 1000 * 1000) ///< Pixel clock frequency in Hz
+#define EXAMPLE_LCD_PIXEL_CLOCK_HZ      (21 * 1000 * 1000) ///< Pixel clock (lowered 30->21 MHz: less framebuffer-read bandwidth so the bounce buffer cannot underrun during PSRAM/WiFi activity -> no residual flicker; ~28 fps is plenty for this UI)
 
 /**
  * @brief Color and Pixel Configuration
@@ -43,7 +43,7 @@
 #define EXAMPLE_RGB_BIT_PER_PIXEL       (16)   ///< RGB interface color depth
 #define EXAMPLE_RGB_DATA_WIDTH          (16)   ///< Data width for RGB interface
 #define EXAMPLE_LCD_RGB_BUFFER_NUMS     (2)    ///< Double-buffer, matches Waveshare 7B LVGL demo (pairs with avoid-tear mode 3 + bounce buffer)
-#define EXAMPLE_RGB_BOUNCE_BUFFER_SIZE  (EXAMPLE_LCD_H_RES * 10) ///< Size of bounce buffer for RGB data
+#define EXAMPLE_RGB_BOUNCE_BUFFER_SIZE  (EXAMPLE_LCD_H_RES * 10) ///< Bounce buffer (10 lines). Do NOT enlarge: bigger bounce buffers eat internal SRAM that WiFi needs, and starving it breaks the connection.
 
 /**
  * @brief GPIO Pins for RGB LCD Signals

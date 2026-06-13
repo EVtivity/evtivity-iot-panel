@@ -10,11 +10,13 @@
 
 # EVtivity CSMS IoT Panel
 
-A WiFi touch-screen control panel for the [EVtivity CSMS](https://evtivity.com), built on the Waveshare ESP32-S3-Touch-LCD-7B (7-inch, 1024x600). The panel provisions itself over a self-hosted WiFi access point, connects to a CSMS deployment with an operator API key, and gives on-site staff a clean two-view interface to monitor and control the charging stations at one site.
+A WiFi touch-screen control panel for the [EVtivity CSMS](https://evtivity.com), built on the Waveshare ESP32-S3-Touch-LCD-7B (7-inch, 1024x600). The panel provisions itself over a self-hosted WiFi access point, connects to a CSMS deployment with an operator API key, and gives on-site staff a clean touch interface to monitor and control the charging stations at one site.
 
 This repository holds the portable LVGL UI, the Arduino firmware, and a host simulator that renders the UI to pixel-true PNGs. The 7B panel is driven with Waveshare's own 7B drivers; it is not supported by `ESP32_Display_Panel`.
 
 ## Screenshots
+
+![Dashboard](docs/images/screenshot-dashboard.png)
 
 | Charging | Settings |
 | --- | --- |
@@ -23,10 +25,12 @@ This repository holds the portable LVGL UI, the Arduino firmware, and a host sim
 ## What it does
 
 - Exposes a setup access point on first boot. A phone or laptop joins it and opens a captive portal to enter the WiFi credentials plus the CSMS base URL, operator API key, and site ID.
+- Opens to a **Dashboard** with at-a-glance site health (online, charging, available, needs-attention), today's energy / sessions / revenue, and a connector-status bar.
 - After provisioning, it connects to the WiFi network and the CSMS REST API.
-- Shows two on-screen views:
+- Shows three on-screen views:
+  - **Dashboard** opens to site health at a glance: online / charging / available / needs-attention counts, today's energy, sessions, and revenue, and a connector-status bar.
   - **Charging** lists every station at the configured site with live status, and lets the operator start and stop charging, clear faults, and drive the built-in simulator.
-  - **Settings** edits the connection configuration and device preferences, and runs maintenance actions (reconnect, reboot, factory reset).
+  - **Settings** shows the connection details and runs maintenance actions, including a Reboot button.
 
 ### Start charging requires free vend
 
