@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16)
+project(evtivity_sim C)
+set(CMAKE_C_STANDARD 11)
+add_compile_definitions(LV_CONF_INCLUDE_SIMPLE)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+add_subdirectory(lvgl)
+add_executable(sim main.c screens.c assets/logo32.c assets/logo96.c)
+target_link_libraries(sim PRIVATE lvgl)

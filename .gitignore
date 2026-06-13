@@ -1,0 +1,22 @@
+# LVGL source (cloned on demand; see sim/README.md)
+sim/lvgl/
+
+# CMake build output
+sim/build/
+
+# Simulator scratch
+sim/assets/*.html
+*.o
+*.obj
+
+# macOS
+.DS_Store
+
+# Internal docs: keep only the build / flashing / hardware references in git
+docs/*.md
+!docs/BUILD.md
+!docs/FLASHING.md
+!docs/HARDWARE-7B.md
+
+# Internal notes
+TODO.md
